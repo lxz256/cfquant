@@ -8,6 +8,7 @@ import time
 import uuid
 
 from .protocol import loads_message, pack_event, pack_response
+from .order_identity import prepare_order_remark, order_remark_key, original_order_remark, restore_order_remark, is_unique_order_remark
 from .stock_connect import connect_account_type, validate_connect_order, validate_connect_market, query_connect_exchange_rate
 from .batch_orders import (
     CFTRADER_BATCH_CANCEL_ACTIONS,
@@ -985,11 +986,7 @@ class TxTradeBridge(object):
         if not account_id:
             raise ValueError("account_id is required")
         price_type = params.get("price_type", 11)
-        order_remark = self._first_param(
-            params,
-            ("order_remark", "remark", "strategy_name"),
-            msg.get("id", "tx_order"),
-        )
+        order_remark = prepare_order_remark(params, msg.get("id", "tx_order"))
         strategy_name = params.get("strategy_name", "")
         qmt_strategy_name = self._register_order_error_context(
             account_id,
@@ -1120,7 +1117,8 @@ class TxTradeBridge(object):
         return {
             "request_result": result,
             "order_id": order_id if order_id is not None else -1,
-            "order_remark": order_remark,
+            "order_remark": original_order_remark(order_remark),
+            "cfquant_order_remark": order_remark,
             "order_type": order_type,
             "account_type": str(account_type or "").upper(),
             "previous_order_id": previous_order_id,
@@ -1206,7 +1204,7 @@ class TxTradeBridge(object):
         if not isinstance(order, dict):
             return False
         account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
-        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
+        order_remark = order_remark_key(order)
         strategy_name = str(self._first_value(order, ("strategy_name", "m_strStrategyName")) or "")
         stock_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
         stock_base = stock_code.split(".", 1)[0]
@@ -1303,7 +1301,7 @@ class TxTradeBridge(object):
                     if pending_sync_order is not None else None
                 )
                 for order in orders or []:
-                    if str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "") != str(order_remark or ""):
+                    if order_remark_key(order) != str(order_remark or ""):
                         continue
                     stock_code = str(params.get("stock_code", params.get("code", "")) or "").upper()
                     candidate_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
@@ -1451,7 +1449,8 @@ class TxTradeBridge(object):
                 "price": params.get("price", 0),
                 "order_volume": params.get("order_volume", params.get("num", 0)),
                 "strategy_name": strategy_name,
-                "order_remark": order_remark,
+                "order_remark": original_order_remark(order_remark),
+                "cfquant_order_remark": order_remark,
                 "user_order_id": order_remark,
                 "client_order_id": order_remark,
                 "quick_trade": params.get("quick_trade", 2),
@@ -1630,7 +1629,7 @@ class TxTradeBridge(object):
             ).upper(),
             "stock_code": str(params.get("stock_code", params.get("code", "")) or "").upper(),
             "strategy_name": params.get("strategy_name", ""),
-            "order_remark": result.get("order_remark", params.get("order_remark", "")),
+            "order_remark": order_remark_key(result) or order_remark_key(params),
             "previous_order_id": result.get("previous_order_id"),
             "created_at": time.time(),
         }
@@ -1664,7 +1663,7 @@ class TxTradeBridge(object):
         key = (
             str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip(),
             str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").strip().upper().split(".", 1)[0],
-            str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or ""),
+            order_remark_key(order),
         )
         with self.order_request_metadata_lock:
             metadata = self.order_request_metadata.get(key)
@@ -1685,6 +1684,8 @@ class TxTradeBridge(object):
                     matches = []
                     for candidate_key, candidate in self.order_request_metadata.items():
                         if candidate_key[0] != key[0]:
+                            continue
+                        if key[2] and is_unique_order_remark(candidate_key[2]) and candidate_key[2] != key[2]:
                             continue
                         if key[1] and candidate_key[1] and key[1] != candidate_key[1]:
                             continue
@@ -1718,7 +1719,8 @@ class TxTradeBridge(object):
             for name in ("m_strRemark", "m_strOrderRemark"):
                 if not order.get(name):
                     order[name] = order_remark
-        if order_id is not None:
+        if order_id is not None and (is_unique_order_remark(key[2]) or
+                                    order_id == self._order_id_from_detail(order)):
             order_meta.reconcile_order_id(order, order_id)
             for name in ("m_nRef", "m_nOrderID"):
                 if self._normalize_order_id(order.get(name)) is None:
@@ -1726,7 +1728,7 @@ class TxTradeBridge(object):
             for name in ("m_strOrderRef", "m_strOrderID"):
                 if order.get(name) is None or str(order.get(name)).strip() in ("", "0", "-1"):
                     order[name] = str(order_id)
-        return order
+        return restore_order_remark(order)
 
     def _enrich_query_order_meta_fields(self, data, account_id="", account_type=""):
         if not isinstance(data, dict):
@@ -1777,10 +1779,18 @@ class TxTradeBridge(object):
             ctx = self.order_meta_cache._ctx(callback_record)
             for order_ref in order_refs:
                 record = self.order_meta_cache.by_ref.get(ctx + (order_ref,))
+                if record and user_order_id and is_unique_order_remark(order_meta.user_order_id_from_data(record)):
+                    if user_order_id != order_meta.user_order_id_from_data(record):
+                        record = None
                 if record:
                     return record, {"match_confidence": "order_ref"}
             if user_order_id:
                 record = self.order_meta_cache.by_user.get(ctx + (user_order_id,))
+                if record and not is_unique_order_remark(user_order_id):
+                    query_id = self._order_id_from_detail(data)
+                    canonical_id = order_meta.canonical_order_id_from_record(record)
+                    if query_id is not None and canonical_id is not None and query_id != canonical_id:
+                        record = None
                 if record:
                     bound_order_ref = ""
                     if order_refs:
@@ -1817,7 +1827,7 @@ class TxTradeBridge(object):
         if order_id is None:
             return None
         account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
-        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
+        order_remark = order_remark_key(order)
         strategy_name = str(self._first_value(order, ("strategy_name", "m_strStrategyName")) or "")
         stock_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
         stock_code_base = stock_code.split(".", 1)[0]
@@ -1830,6 +1840,8 @@ class TxTradeBridge(object):
                     continue
                 expected_remark = str(item.get("order_remark") or "")
                 expected_strategy = str(item.get("strategy_name") or "")
+                if is_unique_order_remark(expected_remark) and order_remark != expected_remark:
+                    continue
                 if order_remark and expected_remark and order_remark != expected_remark:
                     continue
                 if not order_remark and strategy_name and expected_strategy and strategy_name != expected_strategy:
@@ -1865,6 +1877,7 @@ class TxTradeBridge(object):
             order_id=order_id,
         )
         self._send_async_order_response(record, order_id)
+        restore_order_remark(order)
         return True
 
     def _send_async_order_response(self, record, order_id):
@@ -1876,7 +1889,7 @@ class TxTradeBridge(object):
             "order_remark": record.get("order_remark", ""),
             "seq": record.get("seq"),
         }
-        self._send_trader_event(record.get("client_id"), "on_order_stock_async_response", data)
+        self._send_trader_event(record.get("client_id"), "on_order_stock_async_response", restore_order_remark(data))
 
     def _order_stock_batch(self, params, msg):
         orders = params.get("orders") or []
@@ -4019,11 +4032,12 @@ class TxTradeBridge(object):
 
     def _default_log_file(self):
         base_dir = os.getcwd()
-        log_dir = (
-            os.environ.get("CFQUANT_QMT_LOG_DIR")
-            or os.environ.get("CFQUANT_LOG_DIR")
-            or os.path.join(base_dir, "log")
-        )
+        configured = os.environ.get("CFQUANT_QMT_LOG_DIR")
+        if configured:
+            log_dir = configured
+        else:
+            log_root = os.environ.get("CFQUANT_LOG_DIR")
+            log_dir = os.path.join(log_root, "qmt_bridge") if log_root else os.path.join(base_dir, "log", "qmt_bridge")
         log_dir = os.path.abspath(log_dir)
         try:
             os.makedirs(log_dir, exist_ok=True)

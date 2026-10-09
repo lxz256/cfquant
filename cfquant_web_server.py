@@ -32,7 +32,13 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
-from cfquant.log_management import RollingLogWriter, retention_days as validate_log_retention_days, log_files as list_log_files, read_log as read_managed_log
+from cfquant.log_management import (
+    RollingLogWriter,
+    component_log_dirs,
+    retention_days as validate_log_retention_days,
+    log_files as list_log_files,
+    read_log as read_managed_log,
+)
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from functools import wraps
@@ -184,14 +190,15 @@ except Exception:
             pass
 LOG_DIR = os.path.abspath(os.environ.get("CFQUANT_LOG_DIR") or os.path.join(STATE_DIR, "log"))
 try:
-    os.makedirs(LOG_DIR, exist_ok=True)
+    LOG_COMPONENT_DIRS = component_log_dirs(LOG_DIR)
 except Exception:
     LOG_DIR = os.path.join(tempfile.gettempdir(), "cfquant", "log")
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
+        LOG_COMPONENT_DIRS = component_log_dirs(LOG_DIR)
     except Exception:
         LOG_DIR = tempfile.gettempdir()
-LOG_FILE = os.path.join(LOG_DIR, "cfquant_web_server.runtime.log")
+        LOG_COMPONENT_DIRS = {name: LOG_DIR for name in ("web", "startup", "lttx", "pipe_hub", "qmt_bridge")}
+LOG_FILE = os.path.join(LOG_COMPONENT_DIRS["web"], "cfquant_web_server.runtime.log")
 LOG_RETENTION_DAYS = int(os.environ.get("CFQUANT_LOG_RETENTION_DAYS", "30"))
 LOG_RETENTION_DAYS = max(1, min(3650, LOG_RETENTION_DAYS))
 LOG_CLEANUP_INTERVAL_SECONDS = float(os.environ.get("CFQUANT_LOG_CLEANUP_INTERVAL_SECONDS", "21600"))
@@ -435,12 +442,12 @@ LTTX_HOST = os.environ.get("CFQUANT_LTTX_HOST", "127.0.0.1")
 LTTX_PORT = int(os.environ.get("CFQUANT_LTTX_PORT", "2049"))
 LTTX_DIR = os.path.join(BASE_DIR, "LTtx", "tx")
 LTTX_ENTRY = os.environ.get("CFQUANT_LTTX_ENTRY") or os.path.join(LTTX_DIR, "LTtx_server.py")
-LTTX_STDOUT_LOG = os.path.join(LOG_DIR, "lttx_server.stdout.log")
-LTTX_STDERR_LOG = os.path.join(LOG_DIR, "lttx_server.stderr.log")
+LTTX_STDOUT_LOG = os.path.join(LOG_COMPONENT_DIRS["lttx"], "lttx_server.stdout.log")
+LTTX_STDERR_LOG = os.path.join(LOG_COMPONENT_DIRS["lttx"], "lttx_server.stderr.log")
 PIPE_HUB_ENTRY = os.environ.get("CFQUANT_PIPE_HUB_ENTRY") or os.path.join(_SOURCE_ROOT, "cfquant_pipe_hub.py")
 PIPE_HUB_MODULE = "cfquant_pipe_hub"
-PIPE_HUB_STDOUT_LOG = os.path.join(LOG_DIR, "cfquant_pipe_hub.stdout.log")
-PIPE_HUB_STDERR_LOG = os.path.join(LOG_DIR, "cfquant_pipe_hub.stderr.log")
+PIPE_HUB_STDOUT_LOG = os.path.join(LOG_COMPONENT_DIRS["pipe_hub"], "cfquant_pipe_hub.stdout.log")
+PIPE_HUB_STDERR_LOG = os.path.join(LOG_COMPONENT_DIRS["pipe_hub"], "cfquant_pipe_hub.stderr.log")
 PIPE_HUB_STATUS_FILE = os.environ.get("CFQUANT_PIPE_HUB_STATUS_FILE") or os.path.join(
     RUNTIME_STATUS_DIR,
     "cfquant_pipe_hub_status.json",
@@ -3224,6 +3231,8 @@ class WebRuntimeConfig(object):
             "retention_days": configured_days,
             "local_cfquant_logs_enabled": True,
             "qmt_userdata_log_cleanup_enabled": self.qmt_userdata_log_cleanup_enabled(),
+            "log_root": LOG_DIR,
+            "log_directories": dict(LOG_COMPONENT_DIRS),
         }
 
     def set_log_cleanup_settings(self, cleanup_qmt_userdata_logs=None, retention_days=None):
@@ -14877,6 +14886,7 @@ def project_system_info(version_info=None):
         "state_dir": STATE_DIR,
         "runtime_dir": RUNTIME_DIR,
         "log_dir": LOG_DIR,
+        "log_directories": dict(LOG_COMPONENT_DIRS),
         "start_script": start_script,
         "start_script_exists": os.path.isfile(start_script),
         "restart_script": restart_script,
@@ -16865,7 +16875,7 @@ def spawn_reloaded_web_server(reload_request):
     reload_log = None
     try:
         try:
-            reload_log = open(os.path.join(LOG_DIR, "cfquant_web_reload.log"), "ab")
+            reload_log = open(os.path.join(LOG_COMPONENT_DIRS["startup"], "cfquant_web_reload.log"), "ab")
         except Exception:
             reload_log = None
         process = subprocess.Popen(

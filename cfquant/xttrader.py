@@ -13,6 +13,7 @@ from .config import get_config
 from .channels import channels_for_bridge, normalize_bridge_id
 from .protocol import new_id
 from .order_meta import positive_order_id
+from .order_identity import prepare_order_remark, order_remark_key, is_unique_order_remark
 from . import xtconstant
 from .stock_connect import connect_account_type, validate_connect_order
 from .xttype import (
@@ -941,6 +942,7 @@ class XtQuantTrader(object):
         return True
 
     def _register_pending_async_order(self, request):
+        internal_remark = prepare_order_remark(request)
         account = request.get("account") or {}
         record = {
             "seq": request.get("seq"),
@@ -949,6 +951,7 @@ class XtQuantTrader(object):
             "stock_code": str(request.get("stock_code") or "").strip().upper(),
             "strategy_name": str(request.get("strategy_name") or ""),
             "order_remark": str(request.get("order_remark") or ""),
+            "cfquant_order_remark": internal_remark,
             "created_at": time.time(),
         }
         with self._pending_async_orders_lock:
@@ -999,7 +1002,7 @@ class XtQuantTrader(object):
         account_id = _event_account_id(order)
         stock_code = str(getattr(order, "stock_code", "") or "").strip().upper()
         stock_code_base = stock_code.split(".", 1)[0]
-        order_remark = str(getattr(order, "order_remark", "") or "")
+        order_remark = order_remark_key(order)
         with self._pending_async_orders_lock:
             self._prune_async_order_state_locked()
             matched = None
@@ -1009,7 +1012,9 @@ class XtQuantTrader(object):
                 expected_code = str(item.get("stock_code") or "").upper()
                 if expected_code and stock_code and expected_code.split(".", 1)[0] != stock_code_base:
                     continue
-                expected_remark = str(item.get("order_remark") or "")
+                expected_remark = order_remark_key(item)
+                if is_unique_order_remark(expected_remark) and order_remark != expected_remark:
+                    continue
                 if order_remark and expected_remark and order_remark != expected_remark:
                     continue
                 matched = self._pending_async_orders.pop(index)
@@ -1025,6 +1030,7 @@ class XtQuantTrader(object):
             "order_id": order_id,
             "strategy_name": matched.get("strategy_name", ""),
             "order_remark": matched.get("order_remark", ""),
+            "cfquant_order_remark": matched.get("cfquant_order_remark", ""),
             "seq": matched.get("seq"),
         })
 

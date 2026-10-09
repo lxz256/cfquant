@@ -131,9 +131,9 @@ set CFQUANT_PYTHON_EXE=C:\Users\用户名\anaconda3\envs\quant\python.exe
 start_cfquant.bat
 ```
 
-Web 控制台启动后，请在初始化配置中确认或修改 Python 解释器路径。后续启动会优先使用已保存的路径；启动选择结果和失败原因记录在 `log\cfquant_startup.log`。
+Web 控制台启动后，请在初始化配置中确认或修改 Python 解释器路径。后续启动会优先使用已保存的路径；启动选择结果和失败原因记录在 `log\startup\cfquant_startup.log`。
 
-自动安装失败时，启动窗口会保持打开，并把安装日志写入 `log\cfquant_startup.log`，修复 Python、网络或权限问题后重新启动即可。
+自动安装失败时，启动窗口会保持打开，并把安装日志写入 `log\startup\cfquant_startup.log`，修复 Python、网络或权限问题后重新启动即可。
 
 项目默认使用清华 PyPI 镜像安装依赖，适合中国大陆网络环境。启动脚本、网页源码更新、`requirements.txt` 安装以及 LTtx 缺失依赖自动安装都会遵循这个设置。需要切换到企业私有源或其他镜像时，可在启动前设置 `CFQUANT_PIP_INDEX_URL` 环境变量。
 
@@ -214,8 +214,8 @@ cfquant Web 每次启动时都会读取已保存的绑定：只要账号处于�
 
 | 现象 | 优先检查 |
 |---|---|
-| 双击启动窗口后立即退出 | 查看 `log\cfquant_startup.log`；确认 Python 路径存在，或设置 `CFQUANT_PYTHON_EXE`。 |
-| 页面打不开 | 查看最新的 `log\cfquant_web_server.*.stderr.log`；确认 8765 端口没有被其他程序占用。 |
+| 双击启动窗口后立即退出 | 查看 `log\startup\cfquant_startup.log`；确认 Python 路径存在，或设置 `CFQUANT_PYTHON_EXE`。 |
+| 页面打不开 | 查看最新的 `log\web\cfquant_web_server.*.stderr.log`；确认 8765 端口没有被其他程序占用。 |
 | 页面在线但 QMT 不在线 | 确认 QMT 已登录、QMT 目录正确，并按绑定页提示重新导入或启动入口策略。 |
 | `ModuleNotFoundError: cfquant` | 在运行策略的同一个解释器中执行 `python -m pip install --upgrade cfquant`，再用 `python -c "import cfquant; print(cfquant.__file__)"` 验证。 |
 | 行情为空 | 先用页面接口测试确认证券代码、周期和行情权限；标准行情异常时可对照 `xtdata.get_market_data_ex`。 |

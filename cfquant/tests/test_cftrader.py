@@ -14,6 +14,7 @@ from cfquant.client import CfquantTimeout
 from cfquant.pipe_bridge import PipeTradeBridge, PipeNormalQmtBridge
 from cfquant.normal_bridge import NormalQmtBridge
 from cfquant.protocol import decode_value, loads_message, pack_request, pack_response
+from cfquant.order_identity import order_remark_key, original_order_remark, prepare_order_remark
 from cfquant.tx_trade_bridge import TxTradeBridge
 from cfquant.xttrader import XtQuantTrader, XtQuantTraderCallback
 from cfquant.xttype import StockAccount, XtOrderResponse
@@ -102,10 +103,13 @@ def connected(request, monkeypatch):
 
 
 def complete_async_order(env, order_id, order_remark="", stock_code="600000.SH"):
+    matches = [args[9] for args in env.native_calls
+               if args[3] == stock_code and original_order_remark(args[9]) == order_remark]
+    assert len(matches) == 1
     return env.bridge._handle_async_order_callback({
         "account_id": "TEST_ONLY",
         "stock_code": stock_code,
-        "order_remark": order_remark,
+        "order_remark": matches[0],
         "order_id": order_id,
     })
 
@@ -122,7 +126,7 @@ def test_async_prefixed_sysid_does_not_suppress_real_order_id(connected, batch, 
     else:
         seq = env.api.order_stock_async(env.account, **request)
     notification = dict(account_id="TEST_ONLY", stock_code=request["stock_code"],
-                        order_remark=request["order_remark"], order_id=prefix + "899",
+                        order_remark=env.native_calls[-1][9], order_id=prefix + "899",
                         order_sysid="899")
     if native_ref is not None:
         notification["m_nRef"] = native_ref
@@ -162,7 +166,7 @@ def test_single_cancel_async_returns_seq_and_deduplicates_callback(connected):
     assert seq > 0
     assert len(env.cancel_responses) == 1
     assert env.cancel_responses[0].seq == seq
-    assert env.cancel_responses[0].order_id == "1001"
+    assert env.cancel_responses[0].order_id == 1001
     assert env.cancel_responses[0].cancel_result == 0
     assert env.trader._pending_async_cancels == {}
 
@@ -188,7 +192,7 @@ def test_single_cancel_sysid_async_preserves_sysid_and_deduplicates_callback(con
     assert seq > 0
     assert len(env.cancel_responses) == 1
     assert env.cancel_responses[0].seq == seq
-    assert env.cancel_responses[0].order_id == "SYS-1001"
+    assert env.cancel_responses[0].order_id == -1
     assert env.cancel_responses[0].order_sysid == "SYS-1001"
     assert env.cancel_responses[0].cancel_result == 0
     assert env.trader._pending_async_cancels == {}
@@ -224,6 +228,17 @@ def test_single_sync_waits_for_internal_id_when_broker_id_arrives_first(
     env.outcomes[:] = [native_result]
     last_ids = iter([str(sysid - 1), str(sysid)])
     monkeypatch.setattr(env.bridge, '_get_last_order_id', lambda *args: int(next(last_ids)))
+    native_submit = env.bridge.globals_dict['passorder']
+
+    def passorder(*args):
+        result = native_submit(*args)
+        # The bridge waits for a readiness callback before polling ORDER.
+        env.bridge._resolve_pending_sync_order_callback(dict(
+            account_id=args[2], stock_code=args[3], order_remark=args[9], order_sysid=str(sysid),
+        ))
+        return result
+
+    env.bridge.globals_dict['passorder'] = passorder
     snapshots = iter([[], [dict(account_id=env.account.account_id, stock_code='000001.SZ',
                                order_remark='delayed-credit-order', order_id=internal_id,
                                order_sysid=str(sysid))]])
@@ -231,7 +246,10 @@ def test_single_sync_waits_for_internal_id_when_broker_id_arrives_first(
 
     def query(params, kind):
         queries.append((params, kind))
-        return next(snapshots)
+        rows = next(snapshots)
+        for row in rows:
+            row['order_remark'] = env.native_calls[-1][9]
+        return rows
 
     monkeypatch.setattr(env.bridge, '_query_trade_detail', query)
     result = env.trader.order_stock(env.account, **order(stock_code='000001.SZ',
@@ -277,7 +295,7 @@ def test_sync_batch_preserves_order_parameters_input_and_session(connected):
     assert [row["order_id"] for row in result["results"]] == [1001, 1002]
     assert [row["order_remark"] for row in result["results"]] == ["rebalance_1", "per_row_remark"]
     assert env.native_calls[0][2:7] == ("TEST_ONLY", "600000.SH", xtconstant.FIX_PRICE, 10.5, 100)
-    assert env.native_calls[1][7] == "per_row"
+    assert env.native_calls[1][7].split('&&&', 1)[0] == "per_row"
     assert all(params["account"]["bridge_id"] == "test_only" for _, params in env.requests)
     assert env.responses == []
     assert len(env.requests) == 1
@@ -448,8 +466,10 @@ def test_credit_and_futures_use_original_order_constants_and_code_case(connected
 
 def test_duplicate_correlation_and_invalid_options_send_nothing(connected):
     env = connected
-    with pytest.raises(ValueError, match="distinct remarks"):
-        env.api.order_stock_batch_async(env.account, [order(order_remark="same"), order(order_remark="same")])
+    repeated = order(order_remark="same")
+    prepare_order_remark(repeated)
+    with pytest.raises(ValueError, match="internal order identity"):
+        env.api.order_stock_batch_async(env.account, [repeated, repeated])
     with pytest.raises(ValueError, match="boolean"):
         env.api.order_stock_batch(env.account, [order()], stop_on_error="false")
     with pytest.raises(ValueError, match="non-empty"):
@@ -491,7 +511,7 @@ def test_sync_resolves_all_ids_after_submission_with_shared_queries(connected, m
         assert len(env.native_calls) == 3
         rows = env.requests[0][1]['orders']
         return [previous] + [dict(stock_code=row['stock_code'].split('.')[0],
-                                 order_remark=row['order_remark'], order_id=6000 + index)
+                                 order_remark=env.native_calls[index][9], order_id=6000 + index)
                              for index, row in reversed(list(enumerate(rows)))]
     monkeypatch.setattr(env.bridge, '_query_trade_detail', query)
     result = env.api.order_stock_batch(env.account, [order(order_remark='first'), order(), order()])
@@ -506,7 +526,7 @@ def test_sync_does_not_bind_ambiguous_order_ids(connected, monkeypatch):
     env.outcomes[:] = [None]
     monkeypatch.setenv('CFQUANT_ORDER_ID_WAIT_SECONDS', '0')
     def query(params, kind):
-        return [dict(stock_code='600000', order_remark='ambiguous', order_id=order_id)
+        return [dict(stock_code='600000', order_remark=env.native_calls[-1][9], order_id=order_id)
                 for order_id in (6000, 6001)] if env.native_calls else []
     monkeypatch.setattr(env.bridge, '_query_trade_detail', query)
     result = env.api.order_stock_batch(env.account, [order(order_remark='ambiguous')])
@@ -534,7 +554,7 @@ def test_lost_batch_response_never_replays_and_late_callbacks_still_work(connect
         assert len(env.trader._pending_async_orders) == 3
         for index, row in enumerate(result['results']):
             env.bridge._handle_async_order_callback(dict(account_id='TEST_ONLY', stock_code=row['stock_code'],
-                                                         order_remark=row['order_remark'], order_id=7000 + index))
+                                                         order_remark=env.native_calls[index][9], order_id=7000 + index))
         assert [response.seq for response in env.responses] == [row['seq'] for row in result['results']]
         assert env.trader._pending_async_orders == []
 

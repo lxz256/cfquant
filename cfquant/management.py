@@ -251,8 +251,8 @@ class RuntimeManager:
                     "CFQUANT_WEB_HOST": "127.0.0.1", "CFQUANT_WEB_PORT": str(self.port),
                     "CFQUANT_LTTX_PORT": str(self.lttx_port), "CFQUANT_PIPE_NAME": self.pipe_name,
                     "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"})
-        log_dir = self.home / "log"
-        log_dir.mkdir(exist_ok=True)
+        log_dir = self.home / "log" / "startup"
+        log_dir.mkdir(parents=True, exist_ok=True)
         kwargs = {"cwd": str(self.project_dir), "env": env, "stdin": subprocess.DEVNULL}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -273,7 +273,7 @@ class RuntimeManager:
         while time.monotonic() < deadline:
             if process is not None and process.poll() is not None:
                 raise ManagementError("Service exited with code %s; see %s" %
-                                      (process.returncode, self.home / "log/management-service.log"), "service_exited")
+                                      (process.returncode, self.home / "log/startup/management-service.log"), "service_exited")
             try:
                 result = self.status(timeout=min(2, max(0.1, deadline - time.monotonic())))
                 if result.get("ready") and result.get("boot_id") != previous_boot:

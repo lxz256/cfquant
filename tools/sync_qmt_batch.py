@@ -17,10 +17,11 @@ ROUTING_END = "# END GENERATED ACCOUNT ROUTING\n"
 
 def shared_source():
     connect = (ROOT / "cfquant/stock_connect.py").read_text(encoding="ascii")
+    identity = (ROOT / "cfquant/order_identity.py").read_text(encoding="ascii")
     batch = (ROOT / "cfquant/batch_orders.py").read_text(encoding="ascii")
     batch = '\n'.join(line for line in batch.split('\n')
-                      if not line.startswith('from .stock_connect import '))
-    return connect.rstrip() + '\n\n' + batch
+                      if not line.startswith(('from .stock_connect import ', 'from .order_identity import ')))
+    return connect.rstrip() + '\n\n' + identity.rstrip() + '\n\n' + batch
 
 
 def account_routing_source():
@@ -189,6 +190,19 @@ def updated_source(source):
         )
 
     order_stock = _class_method(source, 'TxTradeBridge', '_order_stock')
+    order_stock = order_stock.replace(
+        '        order_remark = self._first_param(\n'
+        '            params,\n'
+        '            ("order_remark", "remark", "strategy_name"),\n'
+        '            msg.get("id", "tx_order"),\n'
+        '        )\n',
+        '        order_remark = prepare_order_remark(params, msg.get("id", "tx_order"))\n',
+    )
+    order_stock = order_stock.replace(
+        '            "order_remark": order_remark,\n',
+        '            "order_remark": original_order_remark(order_remark),\n'
+        '            "cfquant_order_remark": order_remark,\n',
+    )
     previous_line = (
         '        previous_order_id = self._get_last_order_id(account_id, account_type, strategy_name) '
         'if capture_previous_id else None\n'
@@ -242,6 +256,12 @@ def updated_source(source):
     source = _replace_class_method(source, 'TxTradeBridge', '_order_stock', order_stock)
 
     sync_methods = (
+        '_async_order_record',
+        '_remember_order_request',
+        '_enrich_order_request_fields',
+        '_consume_pending_async_order',
+        '_handle_async_order_callback',
+        '_send_async_order_response',
         '_get_trading_dates',
         '_register_pending_sync_order',
         '_discard_pending_sync_order',
@@ -253,6 +273,14 @@ def updated_source(source):
     additions = []
     for name in sync_methods:
         replacement = _class_method(core, 'TxTradeBridge', name)
+        replacement = replacement.replace(
+            '            order_meta.reconcile_order_id(order, order_id)\n',
+            '            current_order_id = self._normalize_order_id(order.get("order_id"))\n'
+            '            if current_order_id is not None and current_order_id != order_id:\n'
+            '                order["cfquant_callback_order_id"] = order.get("order_id")\n'
+            '                order["cfquant_order_id_reconciled"] = True\n'
+            '            order["order_id"] = order_id\n',
+        )
         # Standalone entries forward callbacks explicitly to both bridges.
         replacement = replacement.replace('        _register_sync_order_callback_relay(self)\n', '')
         if 'def %s(' % name in source:
