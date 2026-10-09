@@ -223,6 +223,43 @@ cfquant Web 每次启动时都会读取已保存的绑定：只要账号处于�
 
 完整日志位于项目的 `log` 目录。提交问题时，请附上启动日志、页面状态和使用的 Python 版本，删除账号、密码、Token、订单和持仓等敏感信息后再提交。
 
+## 第三方项目自动化接入
+
+`cfquant.management.RuntimeManager` 支持隐藏启动后台服务、通过代码初始化及绑定账号、配置是否自动启动 QMT，并通过官网或 GitHub 更新服务和回滚。无需打开网页，后台服务使用独立目录，更新不会覆盖第三方进程已经导入的 SDK。
+
+```python
+from cfquant.management import RuntimeManager
+
+runtime = RuntimeManager(home=r"D:\MyApp\cfquant")
+runtime.start()  # 隐藏启动；遵循各账号保存的 QMT 启动设置
+runtime.initialize(
+    account_id="YOUR_ACCOUNT_ID", account_type="STOCK",
+    qmt_dir=r"D:\QMT", mode="ctypes",
+    auto_start_qmt=False, strategy_autorun=True, live=False,
+)
+# 用户自行启动并登录 QMT；首次部署前需关闭 QMT。
+runtime.wait_ready("YOUR_ACCOUNT_ID", timeout=120)
+runtime.configure_client()
+
+# 用户关闭 QMT 后，可通过 runtime.updates.apply() 更新后台服务。
+```
+
+查询当前运行版本、已安装版本和远端版本，以及按需自动更新：
+
+```python
+versions = runtime.version_info(force=True)
+print(versions["running_version"], versions["installed_version"], versions["latest_version"])
+
+result = runtime.updates.ensure_latest()  # 重新检查；有更新才安装并重启后台服务
+print(result["status"], result["message"])
+# up_to_date / 已是最新版本：不会下载、重启或关闭 QMT。
+# updated / 已更新；check_failed / 无法确认远端版本；local_newer / 本地版本更高。
+```
+
+`version_info(include_remote=False)` 只查询本地版本；`updates.check(force=True)` 只检查更新。按需更新也识别同版本号的安装包变化，首次安装包哈希未知时会执行一次更新以建立记录。真正需要更新时，默认要求先关闭相关 QMT；也可显式传入 `auto_close_qmt=True` 允许自动关闭。`restart=False` 可留待调用方重启。部分 QMT 部署失败返回 `update_incomplete`，已安装但尚未重启返回 `restart_required`；执行更新失败会抛出 `ManagementError`。
+
+模拟／实盘参数需与实际账号一致。完整的启动策略、更新接口、重复绑定行为与错误处理见 [第三方项目管理 SDK](docs/第三方项目管理SDK.md)。
+
 ## 从 `xtquant` 迁移到 `cfquant`
 
 安装和初始化完成后，通常不需要重写原有策略。先把外部策略中指向 `xtquant` 的导入改成 `cfquant` 对应模块，再按下面的顺序验证。cfquant 负责外部 Python 与 QMT 之间的桥接，QMT 仍然需要登录并运行 Web 绑定页部署的入口策略。

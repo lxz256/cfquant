@@ -553,6 +553,16 @@ QMT_ENTRY_SCRIPT_NAMES = (
 WEB_BOUND_HOST = None
 WEB_BOUND_PORT = None
 WEB_RESTART_REQUEST = None
+MANAGEMENT_BOOT_ID = uuid.uuid4().hex
+MANAGEMENT_STARTED_AT = time.time()
+MANAGEMENT_READY = False
+MANAGEMENT_API_PATHS = frozenset({
+    "/api/management/status", "/api/management/restart", "/api/management/stop",
+    "/api/setup/initialize", "/api/account-config", "/api/account-config/delete",
+    "/api/bindings/status", "/api/project-updates/status", "/api/project-updates/official",
+    "/api/project-updates/github", "/api/project-updates/rollback", "/api/project-updates/ensure-latest",
+    "/api/version", "/api/config",
+})
 WEB_RESTART_LOCK = threading.RLock()
 WEB_RELOAD_WAIT_HOST_ENV = "CFQUANT_WEB_RELOAD_WAIT_HOST"
 WEB_RELOAD_WAIT_PORT_ENV = "CFQUANT_WEB_RELOAD_WAIT_PORT"
@@ -5868,6 +5878,23 @@ class LttxWebRouteServer(object):
 LTTX_WEB_ROUTE = LttxWebRouteServer()
 
 
+def safe_print(message):
+    line = str(message)
+    printed_to_log = False
+    try:
+        print(line)
+        printed_to_log = getattr(sys, "stdout", None) is _LOG_FP
+    except Exception:
+        pass
+    if printed_to_log:
+        return
+    try:
+        if _LOG_FP is not None:
+            _LOG_FP.write(line + "\n")
+    except Exception:
+        pass
+
+
 class RuntimeVersionRegistry(object):
     def __init__(self, ttl_seconds=RUNTIME_REPORT_TTL_SECONDS, persist_file=None):
         self.ttl_seconds = float(ttl_seconds)
@@ -7170,22 +7197,6 @@ def runtime_python_executable():
         pass
     return sys.executable
 
-
-def safe_print(message):
-    line = str(message)
-    printed_to_log = False
-    try:
-        print(line)
-        printed_to_log = getattr(sys, "stdout", None) is _LOG_FP
-    except Exception:
-        pass
-    if printed_to_log:
-        return
-    try:
-        if _LOG_FP is not None:
-            _LOG_FP.write(line + "\n")
-    except Exception:
-        pass
 
 
 def cleanup_files_by_age(root_dir, patterns=None, retention_days=LOG_RETENTION_DAYS, recursive=True):
@@ -8962,7 +8973,7 @@ class CfquantProjectUpdater(object):
                 self._operation_state["phase"] = phase
                 self._operation_state["message"] = message
 
-    def status(self, repo_url=None, ref=None, include_remote=True):
+    def status(self, repo_url=None, ref=None, include_remote=True, force=False):
         repo_url = str(repo_url or DEFAULT_UPDATE_REPO_URL).strip()
         ref = str(ref or DEFAULT_UPDATE_REF).strip() or "main"
         errors = []
@@ -8987,6 +8998,7 @@ class CfquantProjectUpdater(object):
                 include_remote=include_remote,
                 repo_url=repo_url,
                 ref=ref,
+                force_remote=force,
             ),
             "default_repo_url": repo_url,
             "default_official_site_url": DEFAULT_OFFICIAL_SITE_URL,
@@ -9013,36 +9025,75 @@ class CfquantProjectUpdater(object):
                 })
 
     def update_from_official(self, site_url="", fallback_repo_url="", fallback_ref=""):
+        with self._operation("update"):
+            return self._update_from_official(site_url, fallback_repo_url, fallback_ref)
+
+    def ensure_latest(self, auto_close_qmt=False):
+        from cfquant.management import summarize_update_status
+        if not isinstance(auto_close_qmt, bool):
+            raise ValueError("auto_close_qmt must be a bool")
+        with self._operation("update"):
+            self._set_operation_phase("check", "正在检查最新项目版本")
+            check = summarize_update_status(self.status(include_remote=True, force=True))
+            result = {
+                "status": "check_failed", "message": "无法确认远端版本，请稍后重试",
+                "updated": False, "current_version": check["current_version"],
+                "running_version": check["running_version"], "latest_version": check["latest_version"],
+                "restart_required": check["restart_required"], "check": check, "update": None,
+            }
+            if check["available"] is None:
+                return result
+            if not check["available"]:
+                if check["reason"] == "local_newer":
+                    result.update(status="local_newer", message="本地版本高于远端版本，无需更新")
+                elif check["restart_required"]:
+                    result.update(status="restart_required", message="已安装最新版本，需重启后台服务生效")
+                else:
+                    result.update(status="up_to_date", message="已是最新版本")
+                return result
+            if not _RUNNING_FROM_SOURCE:
+                raise RuntimeError("Use RuntimeManager.ensure_installed() to update an isolated service")
+            # Do not inspect or close QMT until an update is actually necessary.
+            qmt_update_preflight(body={"auto_close_qmt": auto_close_qmt}, rows=WEB_CONFIG.account_configs().values())
+            update = self._update_from_official()
+            complete = update.get("update_completed", True)
+            result.update(status="updated" if complete else "update_incomplete",
+                          message="已更新，需重启后台服务生效" if complete else "服务文件已更新，部分 QMT 部署未完成，请检查详情",
+                          updated=True, restart_required=True, update=update,
+                          current_version=update.get("current_version") or check["current_version"])
+            return result
+
+    def _update_from_official(self, site_url="", fallback_repo_url="", fallback_ref=""):
+        """Download/install with the caller holding the project operation lock."""
         site_url = normalize_official_site_url(site_url)
         fallback_repo_url = str(fallback_repo_url or DEFAULT_UPDATE_REPO_URL).strip()
         fallback_ref = str(fallback_ref or DEFAULT_UPDATE_REF).strip()
         official_error = ""
-        with self._operation("update"):
-            with tempfile.TemporaryDirectory(prefix="cfquant_project_update_") as work_dir:
-                source_dir = os.path.join(work_dir, "source")
-                self._set_operation_phase("download", "正在从官网下载完整项目版本")
-                try:
-                    fetched = UPDATER._fetch_official_package(site_url, source_dir)
-                    return self._install_source(source_dir, {
-                        "source": "official_site",
-                        "site_url": site_url or DEFAULT_OFFICIAL_SITE_URL,
-                        "fetch": fetched,
-                    })
-                except Exception as e:
-                    official_error = str(e) or repr(e)
-                    safe_print("official site project update failed, fallback to GitHub: %s" % official_error)
-                if not fallback_repo_url:
-                    raise RuntimeError("官网下载失败且未配置 GitHub 回退源: %s" % official_error)
-                source_dir = os.path.join(work_dir, "github_source")
-                self._set_operation_phase("download", "官网不可用，正在从 GitHub 下载回退版本")
-                fetched = UPDATER._fetch_github(fallback_repo_url, fallback_ref, source_dir)
+        with tempfile.TemporaryDirectory(prefix="cfquant_project_update_") as work_dir:
+            source_dir = os.path.join(work_dir, "source")
+            self._set_operation_phase("download", "正在从官网下载完整项目版本")
+            try:
+                fetched = UPDATER._fetch_official_package(site_url, source_dir)
                 return self._install_source(source_dir, {
-                    "source": "github_fallback",
-                    "repo_url": fallback_repo_url,
-                    "ref": fallback_ref,
-                    "official_site_error": official_error,
+                    "source": "official_site",
+                    "site_url": site_url or DEFAULT_OFFICIAL_SITE_URL,
                     "fetch": fetched,
                 })
+            except Exception as e:
+                official_error = str(e) or repr(e)
+                safe_print("official site project update failed, fallback to GitHub: %s" % official_error)
+            if not fallback_repo_url:
+                raise RuntimeError("官网下载失败且未配置 GitHub 回退源: %s" % official_error)
+            source_dir = os.path.join(work_dir, "github_source")
+            self._set_operation_phase("download", "官网不可用，正在从 GitHub 下载回退版本")
+            fetched = UPDATER._fetch_github(fallback_repo_url, fallback_ref, source_dir)
+            return self._install_source(source_dir, {
+                "source": "github_fallback",
+                "repo_url": fallback_repo_url,
+                "ref": fallback_ref,
+                "official_site_error": official_error,
+                "fetch": fetched,
+            })
 
     def update_from_zip(self, filename, content):
         content = content or b""
@@ -9074,6 +9125,7 @@ class CfquantProjectUpdater(object):
                     raise RuntimeError("project backup not found: %s" % backup_name)
             else:
                 selected = backups[0]
+            self._require_management_support(os.path.join(self._safe_backup_dir(selected), "files"))
             self._set_operation_phase(
                 "backup",
                 "正在备份当前版本，确保回滚失败时可以恢复",
@@ -9127,10 +9179,22 @@ class CfquantProjectUpdater(object):
                 "entry_manual_update": entry_info,
             }
 
+    def _require_management_support(self, source_root):
+        if os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE"):
+            management_module = os.path.join(source_root, "cfquant", "management.py")
+            server_module = os.path.join(source_root, "cfquant_web_server.py")
+            supports_management = False
+            if os.path.isfile(server_module):
+                with open(server_module, encoding="utf-8") as stream:
+                    supports_management = "def management_status(" in stream.read()
+            if not os.path.isfile(management_module) or not supports_management:
+                raise RuntimeError("Target release does not support the management API; service was not changed")
+
     def _install_source(self, source_dir, meta):
         source_root = self._find_source_project(source_dir)
         if not source_root:
             raise RuntimeError("源码中未找到完整 cfquant 项目目录")
+        self._require_management_support(source_root)
         rel_files = self._source_rel_files(source_root)
         if not rel_files:
             raise RuntimeError("源码中没有可更新的项目文件")
@@ -9173,6 +9237,7 @@ class CfquantProjectUpdater(object):
                 changed,
                 entry_info,
                 editable_install=editable_install,
+                qmt_core_deploy=qmt_core_deploy,
             )
             removed = self._prune_backups()
             return {
@@ -9447,6 +9512,7 @@ class CfquantProjectUpdater(object):
         changed,
         entry_info,
         editable_install=None,
+        qmt_core_deploy=None,
     ):
         payload = {
             "updated_at": time.time(),
@@ -9459,6 +9525,7 @@ class CfquantProjectUpdater(object):
             "changed_files": changed,
             "entry_manual_update": entry_info,
             "editable_install": editable_install or {},
+            "qmt_core_deploy": qmt_core_deploy or {},
             "current_version": self._read_project_version(BASE_DIR) or current_core_version(),
         }
         os.makedirs(PROJECT_UPDATE_DIR, exist_ok=True)
@@ -10430,8 +10497,12 @@ def qmt_process_preflight(body=None, row=None):
             "%s (PID %s)" % (item.get("qmt_dir") or item.get("bin_dir"), ",".join(str(pid) for pid in item.get("pids") or []))
             for item in running
         )
-        raise RuntimeError("QMT is running for configured directory; close it before strategy deployment: %s" % details)
+        raise QmtRunningError("QMT is running for configured directory; close it before strategy deployment: %s" % details)
     return snapshots
+
+
+class QmtRunningError(RuntimeError):
+    """A caller must close QMT or explicitly opt in to auto_close_qmt."""
 
 
 def qmt_update_preflight(body=None, rows=None):
@@ -10823,6 +10894,9 @@ def _qmt_auto_login_first_pid(processes, launch=None):
 def qmt_auto_login_apply_for_account(row, request=None, restart=False, reason="save", strategy_deploy=None):
     row = row or {}
     settings = normalize_qmt_auto_login_settings(request, existing=row.get("qmt_auto_login"))
+    policy = management_qmt_start_policy()
+    if policy is not None:
+        settings["enabled"] = policy
     qmt_dir = normalize_optional_path(row.get("qmt_dir") or row.get("python_dir"))
     result = {
         "enabled": bool(settings["enabled"]),
@@ -10978,6 +11052,8 @@ class QmtAutoLoginRestartScheduler:
                 safe_print("QMT 自动重启调度失败: %s" % error)
 
     def run_pending(self, now=None):
+        if management_qmt_start_policy() is False:
+            return []
         if WEB_CONFIG is None:
             return []
         now = now or time.localtime()
@@ -11015,7 +11091,8 @@ def start_configured_qmt_on_web_startup():
         if not isinstance(row, dict) or not account_config_is_enabled(row):
             continue
         settings = normalize_qmt_auto_login_settings(row.get("qmt_auto_login"))
-        if not settings["enabled"]:
+        policy = management_qmt_start_policy()
+        if policy is False or (policy is None and not settings["enabled"]):
             continue
         qmt_dir = normalize_optional_path(row.get("qmt_dir") or row.get("python_dir"))
         key = os.path.normcase(os.path.abspath(qmt_dir)) if qmt_dir else ""
@@ -14320,6 +14397,47 @@ def web_auth_logout(token):
     return web_auth_status()
 
 
+def management_qmt_start_policy():
+    value = os.environ.get("CFQUANT_QMT_AUTO_START", "saved").lower()
+    if value in ("0", "false"):
+        return False
+    if value in ("1", "true"):
+        return True
+    return None
+
+
+def management_status():
+    return {
+        "api_version": 1,
+        "ready": MANAGEMENT_READY,
+        "boot_id": MANAGEMENT_BOOT_ID,
+        "pid": os.getpid(),
+        "state_dir": STATE_DIR,
+        "project_dir": BASE_DIR,
+        "running_from_source": bool(_RUNNING_FROM_SOURCE),
+        "core_version": current_core_version(),
+        "web_version": WEB_VERSION,
+        "auto_start_qmt": management_qmt_start_policy(),
+        "setup": WEB_CONFIG.setup_info(),
+        "account_configs": WEB_CONFIG.account_configs(),
+        "lttx_host": LTTX_HOST,
+        "lttx_port": LTTX_PORT,
+        **management_version_state(),
+    }
+
+
+def management_version_state():
+    installed = current_core_version()
+    version_text = _read_text_file(CORE_VERSION_PATH)
+    web_match = re.search(r"(?m)^WEB_VERSION\s*=\s*['\"]([^'\"]+)['\"]", version_text)
+    installed_web = web_match.group(1) if web_match else WEB_VERSION
+    receipt = PROJECT_UPDATER._read_install_meta()
+    pending = float(receipt.get("updated_at") or 0) > MANAGEMENT_STARTED_AT
+    return {"running_core_version": CORE_VERSION, "installed_core_version": installed,
+            "installed_web_version": installed_web,
+            "restart_required": bool(pending or installed != CORE_VERSION or installed_web != WEB_VERSION)}
+
+
 def web_reload_info(reason="settings"):
     access = server_access_info()
     previous_host = WEB_BOUND_HOST or access.get("bound_host") or ""
@@ -14884,7 +15002,7 @@ def _remote_project_version_info(repo_url=None, ref=None, force=False):
     return result
 
 
-def project_version_info(include_remote=False, force=False, repo_url=None, ref=None, bridge_id=None):
+def project_version_info(include_remote=False, force=False, repo_url=None, ref=None, bridge_id=None, force_remote=False):
     repo_url = str(repo_url or DEFAULT_UPDATE_REPO_URL).strip()
     ref = str(ref or DEFAULT_UPDATE_REF).strip() or "main"
     bridge_id = normalize_bridge_id(bridge_id or DEFAULT_BRIDGE_ID)
@@ -14920,9 +15038,10 @@ def project_version_info(include_remote=False, force=False, repo_url=None, ref=N
         "remote": None,
         "comparison": "unchecked",
         "update_available": None,
+        **management_version_state(),
     }
     if include_remote:
-        remote = _remote_project_version_info(repo_url=repo_url, ref=ref, force=force)
+        remote = _remote_project_version_info(repo_url=repo_url, ref=ref, force=force or force_remote)
         core_comparison = _compare_project_versions(core_version, remote.get("core_version") or remote.get("version"))
         comparison = core_comparison
         web_comparison = _compare_project_versions(WEB_VERSION, remote.get("web_version")) if remote.get("web_version") else "unknown"
@@ -14932,6 +15051,7 @@ def project_version_info(include_remote=False, force=False, repo_url=None, ref=N
         data["core_comparison"] = core_comparison
         data["comparison"] = comparison
         data["web_comparison"] = web_comparison
+        data["installed_web_comparison"] = _compare_project_versions(data["installed_web_version"], remote.get("web_version")) if remote.get("web_version") else "unknown"
         data["update_available"] = comparison in ("newer", "different") or web_comparison in ("newer", "different")
         qmt_runtime_comparison = _compare_project_versions(qmt_runtime_version, remote.get("core_version") or remote.get("version")) if qmt_runtime_version else "unknown"
         qmt_saved_comparison = _compare_project_versions(latest_qmt_core_version, remote.get("core_version") or remote.get("version")) if latest_qmt_core_version else "unknown"
@@ -14981,8 +15101,8 @@ def bridge_update_rollback(body):
     return UPDATER.rollback(bridge_id, body.get("backup") or body.get("backup_name"))
 
 
-def project_update_status(repo_url=None, ref=None, include_remote=True):
-    return PROJECT_UPDATER.status(repo_url=repo_url, ref=ref, include_remote=include_remote)
+def project_update_status(repo_url=None, ref=None, include_remote=True, force=False):
+    return PROJECT_UPDATER.status(repo_url=repo_url, ref=ref, include_remote=include_remote, force=force)
 
 
 def project_update_github(body):
@@ -15780,6 +15900,17 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 self._write_json(ok(result))
                 if reload_requested:
                     schedule_web_reload(self.server, result["reload"])
+            elif parsed.path == "/api/project-updates/ensure-latest":
+                reload_requested = body.get("reload", True)
+                if not isinstance(reload_requested, bool):
+                    raise ValueError("reload must be a bool")
+                result = PROJECT_UPDATER.ensure_latest(auto_close_qmt=body.get("auto_close_qmt", False))
+                reload_requested = reload_requested and result["restart_required"] and result["status"] != "check_failed"
+                if reload_requested:
+                    result["reload"] = {"host": WEB_BOUND_HOST, "port": WEB_BOUND_PORT, "reason": "ensure-latest"}
+                self._write_json(ok(result))
+                if reload_requested:
+                    schedule_web_reload(self.server, result["reload"])
             elif parsed.path == "/api/project-updates/rollback":
                 result = project_update_rollback(body)
                 reload_requested = parse_bool(body.get("reload")) if "reload" in body else True
@@ -15832,6 +15963,21 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                 self._write_json(ok(delete_account_pair(body)))
             elif parsed.path == "/api/account-pairs/verify":
                 self._write_json(ok(verify_account_pair(body)))
+            elif parsed.path in ("/api/management/restart", "/api/management/stop"):
+                if PROJECT_UPDATER.is_busy():
+                    raise ProjectUpdateBusyError("Project update in progress; wait before restarting or stopping")
+                if parsed.path.endswith("/restart"):
+                    if "auto_start_qmt" in body:
+                        policy = body["auto_start_qmt"]
+                        if policy is not None and not isinstance(policy, bool):
+                            raise ValueError("auto_start_qmt must be true, false or null")
+                        os.environ["CFQUANT_QMT_AUTO_START"] = "saved" if policy is None else str(int(policy))
+                    info = {"host": WEB_BOUND_HOST, "port": WEB_BOUND_PORT, "reason": "management"}
+                    self._write_json(ok({"restarting": True, "boot_id": MANAGEMENT_BOOT_ID}))
+                    schedule_web_reload(self.server, info)
+                else:
+                    self._write_json(ok({"stopping": True, "boot_id": MANAGEMENT_BOOT_ID}))
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
             elif parsed.path == "/api/account-config":
                 self._write_json(ok(save_account_runtime_config(body)))
             elif parsed.path == "/api/qmt/processes/stop":
@@ -15860,7 +16006,9 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
             else:
                 self._write_json(fail("not found", 404), status=404)
         except ProjectUpdateBusyError as e:
-            self._write_json(fail(e, 409), status=409)
+            self._write_json(dict(fail(e, 409), code="project_update_busy"), status=409)
+        except QmtRunningError as e:
+            self._write_json(dict(fail(e, 409), code="qmt_running"), status=409)
         except Exception as e:
             self._write_json(fail(e, 400), status=400)
         finally:
@@ -15961,9 +16109,27 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
         return bool(web_auth_token_info(self._provided_web_token(parsed)))
 
     def _has_access_token(self, parsed):
-        return self._web_token_valid(parsed) or self._api_key_valid(parsed)
+        return self._web_token_valid(parsed) or self._api_key_valid(parsed) or self._management_key_valid(parsed)
+
+    def _management_key_valid(self, parsed):
+        if parsed.path not in MANAGEMENT_API_PATHS:
+            return False
+        path = os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE")
+        provided = self.headers.get("X-CFQuant-Management-Key") or ""
+        if not path or not provided:
+            return False
+        try:
+            with open(path, "r", encoding="ascii") as stream:
+                expected = stream.read().strip()
+            return bool(expected) and secrets.compare_digest(provided, expected)
+        except (OSError, ValueError):
+            return False
 
     def _authorized(self, parsed):
+        if parsed.path.startswith("/api/management/") or parsed.path == "/api/project-updates/ensure-latest":
+            return self._has_access_token(parsed)
+        if os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE") and parsed.path in MANAGEMENT_API_PATHS:
+            return self._has_access_token(parsed)
         if parsed.path == "/api/config" or parsed.path in PUBLIC_API_PATHS:
             return True
         if parsed.path in INTERNAL_API_PATHS:
@@ -16117,6 +16283,8 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/health":
                 self._write_json(ok({"status": "ok"}))
+            elif parsed.path == "/api/management/status":
+                self._write_json(ok(management_status()))
             elif parsed.path == "/api/internal/runtime-route":
                 self._write_json(ok(internal_runtime_route_info()))
             elif parsed.path == "/api/config":
@@ -16212,6 +16380,7 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                     repo_url=repo_url,
                     ref=ref,
                     include_remote=include_remote,
+                    force=parse_bool((query.get("force") or ["0"])[0]),
                 )))
             elif parsed.path == "/api/version":
                 include_remote = parse_bool((query.get("remote") or ["1"])[0])
@@ -16225,6 +16394,7 @@ class CfquantWebHandler(BaseHTTPRequestHandler):
                     repo_url=repo_url,
                     ref=ref,
                     bridge_id=bridge_id,
+                    force_remote=parse_bool((query.get("force_remote") or ["0"])[0]),
                 )
                 version_info["system_info"] = project_system_info(version_info)
                 self._write_json(ok(version_info))
@@ -16649,7 +16819,8 @@ def spawn_reloaded_web_server(reload_request):
         port = fallback_port
     restart_script = os.path.join(BASE_DIR, "restart_cfquant.bat")
     hidden_batch_runner = os.path.join(BASE_DIR, "run_hidden_batch.vbs")
-    use_restart_script = os.name == "nt" and os.path.isfile(restart_script)
+    use_restart_script = (os.name == "nt" and os.path.isfile(restart_script)
+                          and not os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE"))
     if use_restart_script:
         # WScript starts the batch through a hidden cmd host. This prevents
         # every nested PowerShell/cmd helper in restart_cfquant.bat from
@@ -16719,6 +16890,7 @@ def spawn_reloaded_web_server(reload_request):
 
 
 def main(argv=None):
+    global MANAGEMENT_READY
     parser = argparse.ArgumentParser(description="Run cfquant local web dashboard.")
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
@@ -16803,9 +16975,11 @@ def main(argv=None):
     QUOTES.start()
     LOG_CLEANUP.start()
     safe_print("cfquant web dashboard listening on http://%s:%s" % (args.host, args.port))
+    MANAGEMENT_READY = True
     try:
         server.serve_forever()
     finally:
+        MANAGEMENT_READY = False
         LOG_CLEANUP.close()
         STATUS_MONITOR.close()
         QMT_AUTO_LOGIN_RESTART_SCHEDULER.close()

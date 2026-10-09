@@ -88,6 +88,8 @@ def ensure_modules_with_version(modules: dict):
                 else:
                     print(f"[AutoInstall] {import_name} 已安装，版本为 {installed_version}，满足要求")
         except ImportError:
+            if os.environ.get("CFQUANT_MANAGEMENT_TOKEN_FILE"):
+                raise RuntimeError("Managed cfquant requires %s; install it in the configured Python environment" % pip_name)
             # 安装或升级
             install_target = pip_name if required_version == "latest" else "%s>=%s" % (pip_name, required_version)
             print(f"[AutoInstall] 正在安装/升级 {pip_name} → {required_version}...")
@@ -1111,7 +1113,7 @@ def main():
     update_time = '2025-09-04'
     import multiprocessing
     config = load_config()
-    port = int(config['port'])
+    port = int(os.environ.get('CFQUANT_LTTX_PORT') or config['port'])
     tocken = config['token']
     ip = get_local_ip()
     if tcp_port_open('127.0.0.1', port):
