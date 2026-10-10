@@ -6,6 +6,7 @@ import threading
 import time
 
 from .config import get_config
+from .order_identity import prepare_order_remark, order_remark_key, original_order_remark, restore_order_remark, is_unique_order_remark
 from .stock_connect import connect_account_type, validate_connect_order, validate_connect_market, query_connect_exchange_rate
 from .logging_i18n import get_log_language, set_log_language, translate_log
 from .protocol import loads_message, pack_event, pack_response
@@ -824,11 +825,7 @@ class CfquantQmtBridge(object):
         params = dict(params)
         params["stock_code"] = validate_connect_order(params, account_type)
         order_type = self._passorder_optype(params, account_type)
-        user_order_id = self._first_param(
-            params,
-            ("order_remark", "remark", "strategy_name"),
-            "cfquant_%s" % int(time.time() * 1000),
-        )
+        user_order_id = prepare_order_remark(params, "cfquant_%s" % int(time.time() * 1000))
         args = (
             order_type,
             params.get("qmt_order_type", 1101),
@@ -876,7 +873,8 @@ class CfquantQmtBridge(object):
         return {
             "order_id": order_id if order_id is not None else -1,
             "request_result": result,
-            "order_remark": user_order_id,
+            "order_remark": original_order_remark(user_order_id),
+            "cfquant_order_remark": user_order_id,
             "order_type": order_type,
             "account_type": str(account_type or "").upper(),
             "previous_order_id": previous_order_id,
@@ -906,7 +904,7 @@ class CfquantQmtBridge(object):
             "account_type": result.get("account_type") or self._account_type_name(account.get("account_type")).upper(),
             "stock_code": str(params.get("stock_code", params.get("code", "")) or "").upper(),
             "strategy_name": params.get("strategy_name", ""),
-            "order_remark": result.get("order_remark", params.get("order_remark", "")),
+            "order_remark": order_remark_key(result) or order_remark_key(params),
             "previous_order_id": result.get("previous_order_id"),
             "created_at": time.time(),
         }
@@ -935,7 +933,7 @@ class CfquantQmtBridge(object):
         key = (
             str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip(),
             str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").strip().upper().split(".", 1)[0],
-            str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or ""),
+            order_remark_key(order),
         )
         with self.order_request_metadata_lock:
             strategy_name = self.order_request_metadata.get(key)
@@ -943,7 +941,7 @@ class CfquantQmtBridge(object):
             order["strategy_name"] = strategy_name
             if not order.get("m_strStrategyName"):
                 order["m_strStrategyName"] = strategy_name
-        return order
+        return restore_order_remark(order)
 
     def _prune_pending_async_orders_locked(self):
         wait_seconds = os.environ.get("CFQUANT_ASYNC_ORDER_RESPONSE_WAIT_SECONDS", 60.0)
@@ -962,7 +960,7 @@ class CfquantQmtBridge(object):
         if order_id is None:
             return None
         account_id = str(self._first_value(order, ("account_id", "m_strAccountID")) or "").strip()
-        order_remark = str(self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark")) or "")
+        order_remark = order_remark_key(order)
         strategy_name = str(self._first_value(order, ("strategy_name", "m_strStrategyName")) or "")
         stock_code = str(self._first_value(order, ("stock_code", "m_strInstrumentID")) or "").upper()
         stock_code_base = stock_code.split(".", 1)[0]
@@ -975,6 +973,8 @@ class CfquantQmtBridge(object):
                     continue
                 expected_remark = str(item.get("order_remark") or "")
                 expected_strategy = str(item.get("strategy_name") or "")
+                if is_unique_order_remark(expected_remark) and order_remark != expected_remark:
+                    continue
                 if order_remark and expected_remark and order_remark != expected_remark:
                     continue
                 if not order_remark and strategy_name and expected_strategy and strategy_name != expected_strategy:
@@ -1003,6 +1003,7 @@ class CfquantQmtBridge(object):
             if not order.get("m_strStrategyName"):
                 order["m_strStrategyName"] = record.get("strategy_name", "")
         self._send_async_order_response(record, order_id)
+        restore_order_remark(order)
         return True
 
     def _send_async_order_response(self, record, order_id):
@@ -1014,7 +1015,7 @@ class CfquantQmtBridge(object):
             "order_remark": record.get("order_remark", ""),
             "seq": record.get("seq"),
         }
-        self._send_trader_event(record.get("client_id"), "on_order_stock_async_response", data)
+        self._send_trader_event(record.get("client_id"), "on_order_stock_async_response", restore_order_remark(data))
 
     def _cancel_order_stock(self, params):
         cancel_func = self._get_global_func("cancel")
@@ -1447,7 +1448,7 @@ class CfquantQmtBridge(object):
                 )
                 candidates = []
                 for order in orders or []:
-                    remark = self._first_value(order, ("order_remark", "m_strRemark", "m_strOrderRemark"))
+                    remark = order_remark_key(order)
                     if str(remark or "") != str(user_order_id or ""):
                         continue
                     stock_code = str(params.get("stock_code", params.get("code", "")) or "").upper()
@@ -1780,11 +1781,12 @@ class CfquantQmtBridge(object):
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         except Exception:
             base_dir = os.getcwd()
-        log_dir = (
-            os.environ.get("CFQUANT_QMT_LOG_DIR")
-            or os.environ.get("CFQUANT_LOG_DIR")
-            or os.path.join(base_dir, "log")
-        )
+        configured = os.environ.get("CFQUANT_QMT_LOG_DIR")
+        if configured:
+            log_dir = configured
+        else:
+            log_root = os.environ.get("CFQUANT_LOG_DIR")
+            log_dir = os.path.join(log_root, "qmt_bridge") if log_root else os.path.join(base_dir, "log", "qmt_bridge")
         log_dir = os.path.abspath(log_dir)
         try:
             os.makedirs(log_dir, exist_ok=True)

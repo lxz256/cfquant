@@ -206,7 +206,10 @@ def _lttx_log_dir():
     log_dir = os.environ.get("CFQUANT_LOG_DIR")
     if log_dir:
         return os.path.abspath(os.path.join(log_dir, "lttx"))
-    return os.path.abspath("log_data")
+    home = os.environ.get("CFQUANT_HOME")
+    if home:
+        return os.path.abspath(os.path.join(home, "log", "lttx"))
+    return os.path.join(_project_root(), "log", "lttx")
 
 def _cleanup_lttx_logs(log_dir):
     try:
@@ -236,7 +239,7 @@ def main_save_log():
         os.makedirs(log_dir, exist_ok=True)
         _cleanup_lttx_logs(log_dir)
     except:
-        log_dir = os.path.abspath("log_data")
+        log_dir = os.path.join(_project_root(), "log", "lttx")
         try:
             os.makedirs(log_dir, exist_ok=True)
         except:
@@ -252,7 +255,8 @@ def main_save_log():
             f.write(str(data)+'\n')
             
 msg = '%s>>>>>>>[info] LTtx程序启动'%(time.strftime("%Y-%m-%d %H:%M:%S"))
-threading.Thread(target = main_save_log).start()
+log_thread = threading.Thread(target=main_save_log, name="lttx-log-writer", daemon=True)
+log_thread.start()
 
 def close_con(client):
     try:

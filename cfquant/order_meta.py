@@ -12,6 +12,7 @@ import json
 import re
 import threading
 from .stock_connect import connect_account_type
+from .order_identity import order_remark_key, restore_order_remark, is_unique_order_remark
 import time
 
 
@@ -239,6 +240,9 @@ def split_push_message(raw):
 
 
 def user_order_id_from_data(data):
+    internal = order_remark_key(data)
+    if is_unique_order_remark(internal):
+        return internal
     return normalize_text(
         first_value(
             data,
@@ -386,11 +390,13 @@ def apply_record_to_callback(data, record, match_info=None):
         return data
     ensure_callback_text_fields(data)
     if not record:
-        return data
+        return restore_order_remark(data)
 
     strategy_name = normalize_text(record.get("strategy_name"))
     order_remark = normalize_text(record.get("order_remark") or record.get("client_order_id") or record.get("user_order_id"))
     user_order_id = normalize_text(record.get("user_order_id") or order_remark)
+    if is_unique_order_remark(user_order_id):
+        data["cfquant_order_remark"] = user_order_id
 
     if strategy_name:
         for name in ("strategy_name", "m_strStrategyName"):
@@ -422,7 +428,7 @@ def apply_record_to_callback(data, record, match_info=None):
     data["cfquant_order_meta_status"] = normalize_text(record.get("status"))
     if match_info and match_info.get("match_confidence"):
         data["cfquant_order_meta_match"] = match_info.get("match_confidence")
-    return data
+    return restore_order_remark(data)
 
 
 def store_entries_for_record(record):
@@ -602,11 +608,19 @@ class OrderMetaCache(object):
             user_order_id = normalize_text(callback_record.get("user_order_id"))
             for order_ref in order_refs:
                 record = self.by_ref.get(self._ctx(callback_record) + (order_ref,))
+                if record and user_order_id and is_unique_order_remark(user_order_id_from_data(record)):
+                    if user_order_id != user_order_id_from_data(record):
+                        record = None
                 if record:
                     confidence = "order_ref"
                     break
             if record is None and user_order_id:
                 record = self.by_user.get(self._ctx(callback_record) + (user_order_id,))
+                if record and not is_unique_order_remark(user_order_id):
+                    callback_id = positive_order_id(callback_record.get("order_id"))
+                    canonical_id = canonical_order_id_from_record(record)
+                    if callback_id is not None and canonical_id is not None and callback_id != canonical_id:
+                        record = None
                 if record:
                     confidence = "user_order_id"
             if record is None and allow_pending:
@@ -674,6 +688,8 @@ class OrderMetaCache(object):
             record_refs = set(order_ref_candidates_from_data(record))
             ref_hit = bool(callback_refs and record_refs and callback_refs.intersection(record_refs))
             if not ref_hit:
+                if is_unique_order_remark(user_order_id_from_data(record)):
+                    continue
                 if not self._has_stock_context_match(record, callback_record):
                     continue
                 if evidence < 3:
@@ -702,6 +718,10 @@ class OrderMetaCache(object):
         matches = []
         for record in self.pending:
             if self._ctx(record) != ctx:
+                continue
+            callback_identity = user_order_id_from_data(callback_record)
+            record_identity = user_order_id_from_data(record)
+            if (callback_identity or is_unique_order_remark(record_identity)) and callback_identity != record_identity:
                 continue
             try:
                 if now - float(record.get("created_at") or now) > self.pending_ttl_seconds:
@@ -734,6 +754,10 @@ class OrderMetaCache(object):
 
     def _context_match_evidence(self, record, callback_record):
         evidence = 0
+        record_identity = user_order_id_from_data(record)
+        callback_identity = user_order_id_from_data(callback_record)
+        if callback_identity and record_identity and callback_identity != record_identity:
+            return -1
         record_stock = stock_code_base(record.get("stock_code") or record.get("stock_code_base"))
         callback_stock = stock_code_base(callback_record.get("stock_code") or callback_record.get("stock_code_base"))
         if callback_stock and record_stock:

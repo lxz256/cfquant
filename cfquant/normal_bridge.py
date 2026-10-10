@@ -10,6 +10,7 @@ import threading
 import time
 
 from . import order_meta
+from .order_identity import prepare_order_remark, order_remark_key, restore_order_remark
 from .level2 import L2_THOUSAND_SUBSCRIPTIONS, quote_callback_data, quote_plain, require_l2_callable, thousand_price
 from .protocol import loads_message, pack_event, pack_response
 from .tx_trade_bridge import TxTradeBridge, relay_sync_order_callback
@@ -714,7 +715,7 @@ class NormalQmtBridge(TxTradeBridge):
         account = params.get("account") or {}
         account_id = account.get("account_id") or params.get("account_id") or self.account_id
         account_type = self._account_type_name(account.get("account_type") or params.get("account_type"))
-        remark = self._first_param(params, ("order_remark", "remark", "strategy_name"), msg.get("id", "tx_order"))
+        remark = prepare_order_remark(params, msg.get("id", "tx_order"))
         strategy = params.get("strategy_name", "")
         try:
             wait = max(0.0, float(params.get("find_order_wait", os.environ.get("CFQUANT_ORDER_ID_WAIT_SECONDS", 2.0)) or 0))
@@ -884,6 +885,7 @@ class NormalQmtBridge(TxTradeBridge):
         ):
             self._enrich_order_request_fields(data)
         self._enrich_callback_order_meta(event_name, data, account_id, account_type)
+        restore_order_remark(data)
         if event_name == "trader:on_stock_order":
             # A synchronous passorder has no reliable return value.  Wake its
             # resolver as soon as the matching QMT callback arrives; the
@@ -950,7 +952,7 @@ class NormalQmtBridge(TxTradeBridge):
         account = str(order.get("account_id") or "").strip()
         code = str(order.get("stock_code") or "").upper().split(".", 1)[0]
         strategy = str(order.get("strategy_name") or "")
-        remark = str(order.get("order_remark") or "")
+        remark = order_remark_key(order)
         with self.pending_order_errors_lock:
             for index, item in enumerate(self.pending_order_errors):
                 error = item.get("data") or {}
@@ -963,7 +965,7 @@ class NormalQmtBridge(TxTradeBridge):
                 error_strategy = str(error.get("strategy_name") or error.get("strategyName") or "")
                 if error_strategy and strategy and error_strategy != strategy and not strategy.startswith(error_strategy + "&&&"):
                     continue
-                error_remark = str(error.get("order_remark") or error.get("m_strRemark") or "")
+                error_remark = order_remark_key(error)
                 if error_remark and remark and error_remark != remark:
                     continue
                 self.pending_order_errors.pop(index)

@@ -170,7 +170,7 @@ remote = RuntimeManager(base_url="http://127.0.0.1:8765", api_key="YOUR_API_KEY"
 remote.status()
 ```
 
-本地托管默认监听 `127.0.0.1`，首次创建 `home/management.key`，通过请求头完成管理鉴权；不要提交或输出此文件。配置与状态位于 `home/runtime`，日志位于 `home/log`，启动故障查看 `home/log/management-service.log`，重启日志查看 `cfquant_web_reload.log`。
+本地托管默认监听 `127.0.0.1`，首次创建 `home/management.key`，通过请求头完成管理鉴权；不要提交或输出此文件。配置与状态位于 `home/runtime`，日志统一位于 `home/log` 的组件子目录，启动故障查看 `home/log/startup/management-service.log`，重启日志查看 `home/log/startup/cfquant_web_reload.log`。
 
 `stop()` 保留可被复用的 LTtx/PipeHub，不终止用户 QMT。独立部署多个服务时，需要分别指定 `port`、`lttx_port`、`pipe_name`，并为各服务绑定不同的 QMT 实例；仅改变 HTTP 端口不会隔离交易路由。
 
